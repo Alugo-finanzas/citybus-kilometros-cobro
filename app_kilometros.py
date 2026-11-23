@@ -332,17 +332,32 @@ with st.sidebar:
         st.stop()
 
     st.subheader("2. Filtros del Dashboard")
-    min_fecha = df_prod["FECHA"].min().date()
-    max_fecha = max(
-        df_prod["FECHA"].max().date(),
-        df_flota["FECHA"].max().date() if not df_flota.empty else df_prod["FECHA"].max().date()
+    df_prod["AÑO"] = df_prod["FECHA"].dt.year
+    anios_disponibles = sorted(df_prod["AÑO"].unique(), reverse=True)
+
+    anios_sel = st.multiselect(
+        "Año",
+        options=anios_disponibles,
+        default=anios_disponibles
     )
+
+    if not anios_sel:
+        st.warning("⚠️ Selecciona al menos un año.")
+        if st.button("🔒 Cerrar sesión", use_container_width=True):
+            st.session_state["autenticado"] = False
+            st.rerun()
+        st.stop()
+
+    df_prod_anio = df_prod[df_prod["AÑO"].isin(anios_sel)]
+    min_fecha = df_prod_anio["FECHA"].min().date()
+    max_fecha = df_prod_anio["FECHA"].max().date()
 
     rango_fechas = st.date_input(
         "Rango de fechas",
         value=(min_fecha, max_fecha),
         min_value=min_fecha,
-        max_value=max_fecha
+        max_value=max_fecha,
+        key=f"rango_fechas_{'_'.join(map(str, sorted(anios_sel)))}"
     )
 
     patios_sel = st.multiselect(
@@ -359,22 +374,20 @@ with st.sidebar:
         st.stop()
 
     # Filtrar dinámicamente solo las rutas que pertenecen al patio(s) seleccionado(s)
-    rutas_en_datos = set(df_prod[df_prod["PATIO"].isin(patios_sel)]["RUTA"].unique())
+    rutas_en_datos = set(df_prod_anio[df_prod_anio["PATIO"].isin(patios_sel)]["RUTA"].unique())
     rutas_en_mapa = {r for r, p in MAPA_RUTA_PATIO.items() if p in patios_sel}
-    rutas_disponibles = sorted(rutas_en_datos | (rutas_en_mapa & set(df_prod["RUTA"].unique())))
+    rutas_disponibles = sorted(rutas_en_datos | (rutas_en_mapa & set(df_prod_anio["RUTA"].unique())))
 
-    # Limpiar automáticamente rutas seleccionadas si el usuario cambia a un patio donde no operan
-    rutas_previas = [r for r in st.session_state.get("filtro_rutas_widget", []) if r in rutas_disponibles]
-    st.session_state["filtro_rutas_widget"] = rutas_previas
-
+    clave_rutas = f"filtro_rutas_{'_'.join(sorted(patios_sel))}_{'_'.join(map(str, sorted(anios_sel)))}"
     rutas_sel = st.multiselect(
         "Rutas del patio seleccionado (vacío = todas)",
         options=rutas_disponibles,
-        key="filtro_rutas_widget"
+        default=[],
+        key=clave_rutas
     )
 
     st.divider()
-    excel_bytes = guardar_consolidado_excel(df_prod, df_perd, df_flota, df_flota_rutas)
+    excel_bytes = guardar_consolidado_excel(df_prod.drop(columns=["AÑO"], errors="ignore"), df_perd, df_flota, df_flota_rutas)
     st.download_button(
         label="Descargar Histórico Consolidado (.xlsx)",
         data=excel_bytes,
@@ -393,18 +406,28 @@ if isinstance(rango_fechas, tuple) and len(rango_fechas) == 2:
 else:
     f_ini = f_fin = pd.to_datetime(rango_fechas[0] if isinstance(rango_fechas, tuple) else rango_fechas)
 
-mask_prod = (df_prod["FECHA"] >= f_ini) & (df_prod["FECHA"] <= f_fin) & (df_prod["PATIO"].isin(patios_sel))
+mask_prod = (
+    (df_prod["AÑO"].isin(anios_sel)) &
+    (df_prod["FECHA"] >= f_ini) &
+    (df_prod["FECHA"] <= f_fin) &
+    (df_prod["PATIO"].isin(patios_sel))
+)
 if rutas_sel:
     mask_prod = mask_prod & (df_prod["RUTA"].isin(rutas_sel))
 df_f = df_prod[mask_prod].copy()
 
-mask_perd = (df_perd["FECHA"] >= f_ini) & (df_perd["FECHA"] <= f_fin) & (df_perd["PATIO"].isin(patios_sel))
-if rutas_sel:
+mask_perd = (
+    (df_perd["FECHA"].dt.year.isin(anios_sel)) &
+    (df_perd["FECHA"] >= f_ini) &
+    (df_perd["FECHA"] <= f_fin) &
+    (df_perd["PATIO"].isin(patios_sel))
+) if not df_perd.empty else pd.Series(dtype=bool)
+if not df_perd.empty and rutas_sel:
     mask_perd = mask_perd & (df_perd["RUTA"].isin(rutas_sel))
-df_perd_f = df_perd[mask_perd].copy()
+df_perd_f = df_perd[mask_perd].copy() if not df_perd.empty else pd.DataFrame()
 
 # ---------------------------------------------------------
-# ENCABEZADO Y SELECTOR DE UNIDAD
+# ENCABEZADO Y SELECTOR DE UNIDAD (FUNCIONAL EN TODAS LAS VISTAS)
 # ---------------------------------------------------------
 col_t1, col_t2 = st.columns([3, 1.3])
 with col_t1:
@@ -419,11 +442,15 @@ with col_t2:
         index=0
     )
 
+ver_km = unidad_vista in ["Ambos (KM + MXN)", "Solo Kilómetros (km)"]
+ver_mxn = unidad_vista in ["Ambos (KM + MXN)", "Solo Financiero ($ MXN)"]
+
 # ---------------------------------------------------------
-# PESTAÑAS PRINCIPALES (4 SECCIONES)
+# PESTAÑAS PRINCIPALES (5 SECCIONES)
 # ---------------------------------------------------------
-tab_semanal, tab_dash, tab_rutas, tab_captura = st.tabs([
+tab_semanal, tab_anual, tab_dash, tab_rutas, tab_captura = st.tabs([
     "Cobro Semanal",
+    "Histórico Anual",
     "Dashboard Ejecutivo & Flota",
     "Matriz por Ruta y Unidades Inactivas",
     "Captura Diaria"
@@ -435,12 +462,15 @@ tab_semanal, tab_dash, tab_rutas, tab_captura = st.tabs([
 with tab_semanal:
     st.subheader("Corte de Cobro Semanal")
 
-    df_sem_base = df_prod[df_prod["PATIO"].isin(patios_sel)].copy()
+    df_sem_base = df_prod[
+        (df_prod["AÑO"].isin(anios_sel)) &
+        (df_prod["PATIO"].isin(patios_sel))
+    ].copy()
     if rutas_sel:
         df_sem_base = df_sem_base[df_sem_base["RUTA"].isin(rutas_sel)]
 
     if df_sem_base.empty:
-        st.info("No hay registros disponibles para el patio o ruta seleccionados.")
+        st.info("No hay registros disponibles para el año, patio o ruta seleccionados.")
     else:
         df_sem_base["SEM_INI"] = df_sem_base["FECHA"].dt.to_period("W-SUN").apply(lambda r: r.start_time)
         df_sem_base["SEM_FIN"] = df_sem_base["FECHA"].dt.to_period("W-SUN").apply(lambda r: r.end_time)
@@ -449,6 +479,7 @@ with tab_semanal:
             Días=("FECHA", "nunique"),
             Km_Programados=("Programados completos", "sum"),
             Km_Realizados=("Realizados", "sum"),
+            Km_Perdidos=("KM PERDIDOS", "sum"),
             Km_Penalizados=("Km penalizado", "sum"),
             Km_a_Cobrar=("KM A COBRAR", "sum"),
             Monto_a_Cobrar_MXN=("INGRESO", "sum"),
@@ -474,38 +505,65 @@ with tab_semanal:
         ult_completa = sem_completa_df.iloc[0] if not sem_completa_df.empty else sem_actual
 
         c_s1, c_s2, c_s3, c_s4 = st.columns(4)
-        c_s1.metric(
-            f"Semana en Curso ({sem_actual['Semana']})",
-            f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
-            delta=f"{int(sem_actual['Días'])} de 7 días capturados",
-            delta_color="off"
-        )
-        c_s2.metric(
-            f"Última Semana Completa ({ult_completa['Semana']})",
-            f"${ult_completa['Monto_a_Cobrar_MXN']:,.2f}",
-            delta=f"{ult_completa['Km_a_Cobrar']:,.1f} km a cobrar",
-            delta_color="normal"
-        )
-        c_s3.metric(
-            "Promedio Semanal (Semanas 7 días)",
-            f"${sem_completa_df['Monto_a_Cobrar_MXN'].mean():,.2f}" if not sem_completa_df.empty else f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
-            delta=f"Cumpl. prom: {sem_completa_df['Cumplimiento %'].mean():.2f}%" if not sem_completa_df.empty else "",
-            delta_color="off"
-        )
-        c_s4.metric(
-            "Dejado de Cobrar (Últ. Sem. Completa)",
-            f"${ult_completa['Ingreso_Perdido_MXN']:,.2f}",
-            delta=f"Penalizados: {ult_completa['Km_Penalizados']:,.1f} km",
-            delta_color="inverse"
-        )
+        if ver_mxn:
+            c_s1.metric(
+                f"Semana en Curso ({sem_actual['Semana']})",
+                f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
+                delta=f"{int(sem_actual['Días'])} de 7 días capturados",
+                delta_color="off"
+            )
+            c_s2.metric(
+                f"Última Semana Completa ({ult_completa['Semana']})",
+                f"${ult_completa['Monto_a_Cobrar_MXN']:,.2f}",
+                delta=f"{ult_completa['Km_a_Cobrar']:,.1f} km a cobrar" if ver_km else f"Cumpl: {ult_completa['Cumplimiento %']:.2f}%",
+                delta_color="normal"
+            )
+            c_s3.metric(
+                "Promedio Semanal (Semanas 7 días)",
+                f"${sem_completa_df['Monto_a_Cobrar_MXN'].mean():,.2f}" if not sem_completa_df.empty else f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
+                delta=f"Cumpl. prom: {sem_completa_df['Cumplimiento %'].mean():.2f}%" if not sem_completa_df.empty else "",
+                delta_color="off"
+            )
+            c_s4.metric(
+                "Dejado de Cobrar (Últ. Sem. Completa)",
+                f"${ult_completa['Ingreso_Perdido_MXN']:,.2f}",
+                delta=f"Penalizados: {ult_completa['Km_Penalizados']:,.1f} km" if ver_km else "Impacto financiero",
+                delta_color="inverse"
+            )
+        else:
+            c_s1.metric(
+                f"Semana en Curso ({sem_actual['Semana']})",
+                f"{sem_actual['Km_a_Cobrar']:,.1f} km",
+                delta=f"{int(sem_actual['Días'])} de 7 días capturados",
+                delta_color="off"
+            )
+            c_s2.metric(
+                f"Última Semana Completa ({ult_completa['Semana']})",
+                f"{ult_completa['Km_a_Cobrar']:,.1f} km a cobrar",
+                delta=f"Realizados: {ult_completa['Km_Realizados']:,.1f} km",
+                delta_color="normal"
+            )
+            c_s3.metric(
+                "Promedio Semanal (Semanas 7 días)",
+                f"{sem_completa_df['Km_Realizados'].mean():,.1f} km" if not sem_completa_df.empty else f"{sem_actual['Km_Realizados']:,.1f} km",
+                delta=f"Cumpl. prom: {sem_completa_df['Cumplimiento %'].mean():.2f}%" if not sem_completa_df.empty else "",
+                delta_color="off"
+            )
+            c_s4.metric(
+                "Km Perdidos (Últ. Sem. Completa)",
+                f"{ult_completa['Km_Perdidos']:,.1f} km",
+                delta=f"Penalizados: {ult_completa['Km_Penalizados']:,.1f} km",
+                delta_color="inverse"
+            )
 
         st.markdown("---")
 
-        cols_sem_tabla = [
-            "Semana", "Estatus", "Días", "Cumplimiento %",
-            "Km_Programados", "Km_Realizados", "Km_Penalizados",
-            "Km_a_Cobrar", "Monto_a_Cobrar_MXN", "Ingreso_Perdido_MXN"
-        ]
+        cols_sem_tabla = ["Semana", "Estatus", "Días", "Cumplimiento %"]
+        if ver_km:
+            cols_sem_tabla += ["Km_Programados", "Km_Realizados", "Km_Penalizados", "Km_a_Cobrar"]
+        if ver_mxn:
+            cols_sem_tabla += ["Monto_a_Cobrar_MXN", "Ingreso_Perdido_MXN"]
+
         st.dataframe(
             resumen_sem[cols_sem_tabla].style.format({
                 "Cumplimiento %": "{:.2f}%",
@@ -540,8 +598,14 @@ with tab_semanal:
                 Monto_a_Cobrar_MXN=("INGRESO", "sum"),
                 Dejado_de_Cobrar_MXN=("INGRESO_PERDIDO", "sum")
             )
+            cols_patio_sem = ["PATIO", "Días"]
+            if ver_km:
+                cols_patio_sem.append("Km_a_Cobrar")
+            if ver_mxn:
+                cols_patio_sem += ["Monto_a_Cobrar_MXN", "Dejado_de_Cobrar_MXN"]
+
             st.dataframe(
-                patio_sem.style.format({
+                patio_sem[cols_patio_sem].style.format({
                     "Km_a_Cobrar": "{:,.2f}",
                     "Monto_a_Cobrar_MXN": "${:,.2f}",
                     "Dejado_de_Cobrar_MXN": "${:,.2f}"
@@ -555,12 +619,16 @@ with tab_semanal:
                 Monto_MXN=("INGRESO", "sum")
             ).sort_values("FECHA")
             dia_sem["Día"] = dia_sem["FECHA"].dt.strftime("%a %d/%b")
+
+            y_bar_sem = "Monto_MXN" if ver_mxn else "Km_a_Cobrar"
+            txt_bar_sem = "$,.0f" if ver_mxn else ",.0f"
+            tit_bar_sem = "Cobro Diario dentro de la Semana" if ver_mxn else "Km a Cobrar Diarios en la Semana"
             fig_dia_sem = px.bar(
-                dia_sem, x="Día", y="Monto_MXN", text_auto="$,.0f",
-                title="Cobro Diario dentro de la Semana",
-                color_discrete_sequence=["#16a34a"]
+                dia_sem, x="Día", y=y_bar_sem, text_auto=txt_bar_sem,
+                title=tit_bar_sem,
+                color_discrete_sequence=["#16a34a" if ver_mxn else "#2563eb"]
             )
-            fig_dia_sem.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="MXN ($)")
+            fig_dia_sem.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="MXN ($)" if ver_mxn else "Kilómetros (km)")
             st.plotly_chart(fig_dia_sem, use_container_width=True)
 
         with col_sd2:
@@ -572,10 +640,16 @@ with tab_semanal:
                 Penalizados=("Km penalizado", "sum"),
                 Km_a_Cobrar=("KM A COBRAR", "sum"),
                 Monto_a_Cobrar_MXN=("INGRESO", "sum")
-            ).sort_values("Monto_a_Cobrar_MXN", ascending=False)
+            ).sort_values("Monto_a_Cobrar_MXN" if ver_mxn else "Km_a_Cobrar", ascending=False)
+
+            cols_ruta_sem = ["RUTA", "PATIO", "Días"]
+            if ver_km:
+                cols_ruta_sem += ["Programados", "Realizados", "Penalizados", "Km_a_Cobrar"]
+            if ver_mxn:
+                cols_ruta_sem.append("Monto_a_Cobrar_MXN")
 
             st.dataframe(
-                ruta_sem.style.format({
+                ruta_sem[cols_ruta_sem].style.format({
                     "Programados": "{:,.2f}",
                     "Realizados": "{:,.2f}",
                     "Penalizados": "{:,.2f}",
@@ -590,8 +664,8 @@ with tab_semanal:
             out_sem = io.BytesIO()
             with pd.ExcelWriter(out_sem, engine="openpyxl") as writer:
                 resumen_sem[cols_sem_tabla].to_excel(writer, sheet_name="Resumen Todas las Semanas", index=False)
-                patio_sem.to_excel(writer, sheet_name="Cobro por Patio", index=False)
-                ruta_sem.to_excel(writer, sheet_name="Cobro por Ruta", index=False)
+                patio_sem[cols_patio_sem].to_excel(writer, sheet_name="Cobro por Patio", index=False)
+                ruta_sem[cols_ruta_sem].to_excel(writer, sheet_name="Cobro por Ruta", index=False)
             st.download_button(
                 label=f"Descargar Excel de Cobro ({semana_elegida})",
                 data=out_sem.getvalue(),
@@ -601,7 +675,150 @@ with tab_semanal:
             )
 
 # =========================================================
-# TAB 2: DASHBOARD EJECUTIVO & FLOTA
+# TAB 2: HISTÓRICO ANUAL Y COMPARATIVA MENSUAL
+# =========================================================
+with tab_anual:
+    st.subheader("Consulta Histórica Separada por Año")
+
+    df_hist_base = df_prod[
+        (df_prod["AÑO"].isin(anios_sel)) &
+        (df_prod["PATIO"].isin(patios_sel))
+    ].copy()
+    if rutas_sel:
+        df_hist_base = df_hist_base[df_hist_base["RUTA"].isin(rutas_sel)]
+
+    if df_hist_base.empty:
+        st.info("No hay registros históricos para los filtros seleccionados.")
+    else:
+        resumen_anual = df_hist_base.groupby("AÑO", as_index=False).agg(
+            Días=("FECHA", "nunique"),
+            Km_Programados=("Programados completos", "sum"),
+            Km_Realizados=("Realizados", "sum"),
+            Km_Perdidos=("KM PERDIDOS", "sum"),
+            Km_Penalizados=("Km penalizado", "sum"),
+            Km_a_Cobrar=("KM A COBRAR", "sum"),
+            Monto_Cobrado_MXN=("INGRESO", "sum"),
+            Dejado_de_Percibir_MXN=("INGRESO_PERDIDO", "sum")
+        ).sort_values("AÑO", ascending=False)
+
+        resumen_anual["Cumplimiento %"] = (
+            (resumen_anual["Km_Realizados"] / resumen_anual["Km_Programados"] * 100)
+            .where(resumen_anual["Km_Programados"] > 0, 0.0)
+            .round(2)
+        )
+        resumen_anual["AÑO"] = resumen_anual["AÑO"].astype(str)
+
+        cols_anual = ["AÑO", "Días", "Cumplimiento %"]
+        if ver_km:
+            cols_anual += ["Km_Programados", "Km_Realizados", "Km_Perdidos", "Km_Penalizados", "Km_a_Cobrar"]
+        if ver_mxn:
+            cols_anual += ["Monto_Cobrado_MXN", "Dejado_de_Percibir_MXN"]
+
+        st.dataframe(
+            resumen_anual[cols_anual].style.format({
+                "Cumplimiento %": "{:.2f}%",
+                "Km_Programados": "{:,.2f}",
+                "Km_Realizados": "{:,.2f}",
+                "Km_Perdidos": "{:,.2f}",
+                "Km_Penalizados": "{:,.2f}",
+                "Km_a_Cobrar": "{:,.2f}",
+                "Monto_Cobrado_MXN": "${:,.2f}",
+                "Dejado_de_Percibir_MXN": "${:,.2f}"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.markdown("---")
+
+        # Desglose mensual por año
+        df_hist_base["MES_NUM"] = df_hist_base["FECHA"].dt.month
+        nombres_mes = {
+            1: "01 - Ene", 2: "02 - Feb", 3: "03 - Mar", 4: "04 - Abr",
+            5: "05 - May", 6: "06 - Jun", 7: "07 - Jul", 8: "08 - Ago",
+            9: "09 - Sep", 10: "10 - Oct", 11: "11 - Nov", 12: "12 - Dic"
+        }
+        df_hist_base["Mes"] = df_hist_base["MES_NUM"].map(nombres_mes)
+        df_hist_base["Año_Str"] = df_hist_base["AÑO"].astype(str)
+
+        mensual_anual = df_hist_base.groupby(["Año_Str", "MES_NUM", "Mes"], as_index=False).agg(
+            Días=("FECHA", "nunique"),
+            Km_Programados=("Programados completos", "sum"),
+            Km_Realizados=("Realizados", "sum"),
+            Km_a_Cobrar=("KM A COBRAR", "sum"),
+            Monto_MXN=("INGRESO", "sum"),
+            Perdido_MXN=("INGRESO_PERDIDO", "sum")
+        ).sort_values(["Año_Str", "MES_NUM"])
+
+        mensual_anual["Cumplimiento %"] = (
+            (mensual_anual["Km_Realizados"] / mensual_anual["Km_Programados"] * 100)
+            .where(mensual_anual["Km_Programados"] > 0, 0.0)
+            .round(2)
+        )
+
+        col_a1, col_a2 = st.columns([1.4, 1])
+        with col_a1:
+            st.markdown("**Evolución Mensual Comparada por Año**")
+            if unidad_vista == "Solo Financiero ($ MXN)":
+                metrica_graf = "Monto_MXN"
+                fmt_graf = "$,.0f"
+            elif unidad_vista == "Solo Kilómetros (km)":
+                metrica_graf = "Km_Realizados"
+                fmt_graf = ",.0f"
+            else:
+                metrica_graf = "Cumplimiento %"
+                fmt_graf = ".1f"
+
+            fig_anual = px.bar(
+                mensual_anual,
+                x="Mes",
+                y=metrica_graf,
+                color="Año_Str",
+                barmode="group",
+                text_auto=fmt_graf,
+                labels={"Año_Str": "Año", "Monto_MXN": "Cobro ($ MXN)", "Km_Realizados": "Km Realizados"}
+            )
+            if metrica_graf == "Cumplimiento %":
+                fig_anual.add_hline(y=95, line_dash="dot", line_color="#16a34a", annotation_text="Meta 95%")
+                fig_anual.update_yaxes(range=[0, 108])
+            fig_anual.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_anual, use_container_width=True)
+
+        with col_a2:
+            st.markdown("**Detalle Mensual por Año**")
+            cols_mens_show = ["Año_Str", "Mes", "Días", "Cumplimiento %"]
+            if ver_km:
+                cols_mens_show.append("Km_a_Cobrar")
+            if ver_mxn:
+                cols_mens_show.append("Monto_MXN")
+
+            st.dataframe(
+                mensual_anual[cols_mens_show].rename(
+                    columns={"Año_Str": "Año"}
+                ).style.format({
+                    "Cumplimiento %": "{:.2f}%",
+                    "Km_a_Cobrar": "{:,.2f}",
+                    "Monto_MXN": "${:,.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True,
+                height=360
+            )
+
+        out_anual = io.BytesIO()
+        with pd.ExcelWriter(out_anual, engine="openpyxl") as writer:
+            resumen_anual[cols_anual].to_excel(writer, sheet_name="Resumen por Año", index=False)
+            mensual_anual.drop(columns=["MES_NUM"]).to_excel(writer, sheet_name="Detalle Mensual por Año", index=False)
+        st.download_button(
+            label="Descargar Histórico por Año (.xlsx)",
+            data=out_anual.getvalue(),
+            file_name="Historico_Anual_Citybus.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+# =========================================================
+# TAB 3: DASHBOARD EJECUTIVO & FLOTA
 # =========================================================
 with tab_dash:
     if df_f.empty:
@@ -617,12 +834,25 @@ with tab_dash:
         cumpl_global = (tot_real / tot_prog * 100) if tot_prog > 0 else 0.0
         brecha_95_km = max(0.0, (tot_prog * 0.95) - tot_real)
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Cumplimiento Ponderado", f"{cumpl_global:.2f}%", delta=f"{cumpl_global - META_VERDE:+.2f}% vs Meta 95%")
-        k2.metric("Kilómetros Realizados", f"{tot_real:,.0f} km", delta=f"de {tot_prog:,.0f} km prog.", delta_color="off")
-        k3.metric("Kilómetros Perdidos", f"{tot_perd:,.0f} km", delta=f"Faltan {brecha_95_km:,.0f} km p/ 95%", delta_color="inverse")
-        k4.metric("Ingreso Real Devengado", f"${tot_ing:,.0f}", delta=f"{tot_cobrar:,.0f} km a cobrar", delta_color="off")
-        k5.metric("Ingreso Dejado de Percibir", f"${tot_ing_perd:,.0f}", delta=f"-{(tot_ing_perd / tot_ing_pot * 100) if tot_ing_pot else 0:.1f}% del potencial", delta_color="inverse")
+        # KPIs adaptados al selector de unidad (Ambos / Solo KM / Solo MXN)
+        if unidad_vista == "Ambos (KM + MXN)":
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Cumplimiento Ponderado", f"{cumpl_global:.2f}%", delta=f"{cumpl_global - META_VERDE:+.2f}% vs Meta 95%")
+            k2.metric("Kilómetros Realizados", f"{tot_real:,.0f} km", delta=f"de {tot_prog:,.0f} km prog.", delta_color="off")
+            k3.metric("Kilómetros Perdidos", f"{tot_perd:,.0f} km", delta=f"Faltan {brecha_95_km:,.0f} km p/ 95%", delta_color="inverse")
+            k4.metric("Ingreso Real Devengado", f"${tot_ing:,.0f}", delta=f"{tot_cobrar:,.0f} km a cobrar", delta_color="off")
+            k5.metric("Ingreso Dejado de Percibir", f"${tot_ing_perd:,.0f}", delta=f"-{(tot_ing_perd / tot_ing_pot * 100) if tot_ing_pot else 0:.1f}% del potencial", delta_color="inverse")
+        elif unidad_vista == "Solo Kilómetros (km)":
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Cumplimiento Ponderado", f"{cumpl_global:.2f}%", delta=f"{cumpl_global - META_VERDE:+.2f}% vs Meta 95%")
+            k2.metric("Kilómetros Realizados", f"{tot_real:,.0f} km", delta=f"de {tot_prog:,.0f} km prog.", delta_color="off")
+            k3.metric("Kilómetros a Cobrar", f"{tot_cobrar:,.0f} km", delta="Base neta de cobro", delta_color="off")
+            k4.metric("Kilómetros Perdidos", f"{tot_perd:,.0f} km", delta=f"Faltan {brecha_95_km:,.0f} km p/ 95%", delta_color="inverse")
+        else:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Ingreso Real Devengado", f"${tot_ing:,.2f}", delta=f"Cumpl: {cumpl_global:.2f}%", delta_color="off")
+            k2.metric("Ingreso Potencial (100%)", f"${tot_ing_pot:,.2f}", delta="Meta máxima contractual", delta_color="off")
+            k3.metric("Ingreso Dejado de Percibir", f"${tot_ing_perd:,.2f}", delta=f"-{(tot_ing_perd / tot_ing_pot * 100) if tot_ing_pot else 0:.1f}% del potencial", delta_color="inverse")
 
         # Bloque de Estado de Flota e Inactivos (Matutino y Vespertino)
         if not df_flota.empty or not df_flota_rutas.empty:
@@ -728,6 +958,11 @@ with tab_dash:
                 fig_hist.add_trace(go.Bar(x=diario["FECHA"], y=diario["INGRESO"], name="Ingreso Real ($ MXN)", marker_color="#2563eb"))
                 fig_hist.add_trace(go.Bar(x=diario["FECHA"], y=diario["INGRESO_PERDIDO"], name="Ingreso Perdido ($ MXN)", marker_color="#ef4444"))
                 fig_hist.update_layout(barmode="stack", height=370, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="MXN ($)")
+            elif unidad_vista == "Solo Kilómetros (km)":
+                fig_hist = go.Figure()
+                fig_hist.add_trace(go.Bar(x=diario["FECHA"], y=diario["Realizados"], name="Km Realizados", marker_color="#1d4ed8"))
+                fig_hist.add_trace(go.Bar(x=diario["FECHA"], y=diario["KM PERDIDOS"], name="Km Perdidos", marker_color="#f59e0b"))
+                fig_hist.update_layout(barmode="stack", height=370, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Kilómetros (km)")
             else:
                 fig_hist = go.Figure()
                 fig_hist.add_trace(go.Scatter(x=diario["FECHA"], y=diario["Cumplimiento %"], mode="lines+markers", name="% Cumplimiento Diario", line=dict(color="#1d4ed8", width=2.5), marker=dict(size=6)))
@@ -759,6 +994,13 @@ with tab_dash:
                     color_discrete_map={"INGRESO": "#16a34a", "INGRESO_PERDIDO": "#dc2626"},
                     labels={"value": "MXN ($)", "variable": "Concepto"}
                 )
+            elif unidad_vista == "Solo Kilómetros (km)":
+                fig_patio = px.bar(
+                    patio_df, x="PATIO", y=["Realizados", "KM PERDIDOS"],
+                    barmode="group", text_auto=",.0f",
+                    color_discrete_map={"Realizados": "#2563eb", "KM PERDIDOS": "#f59e0b"},
+                    labels={"value": "Kilómetros (km)", "variable": "Concepto"}
+                )
             else:
                 fig_patio = px.bar(
                     patio_df, x="PATIO", y="Cumplimiento %",
@@ -768,7 +1010,7 @@ with tab_dash:
                 fig_patio.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
                 fig_patio.add_hline(y=95, line_dash="dot", line_color="#16a34a")
                 fig_patio.update_yaxes(range=[0, 108])
-            fig_patio.update_layout(height=370, margin=dict(l=10, r=10, t=30, b=10), showlegend=(unidad_vista == "Solo Financiero ($ MXN)"))
+            fig_patio.update_layout(height=370, margin=dict(l=10, r=10, t=30, b=10), showlegend=(unidad_vista != "Ambos (KM + MXN)"))
             st.plotly_chart(fig_patio, use_container_width=True)
 
         st.subheader("Causa Raíz de Kilómetros Perdidos (Desglose por Motivo)")
@@ -792,8 +1034,14 @@ with tab_dash:
 
             with col_m2:
                 tabla_mot = motivos_tot.sort_values("Km Perdidos", ascending=False).copy()
+                cols_mot_show = ["Motivo", "% del Total"]
+                if ver_km:
+                    cols_mot_show.insert(1, "Km Perdidos")
+                if ver_mxn:
+                    cols_mot_show.append("Impacto Est. ($ MXN)")
+
                 st.dataframe(
-                    tabla_mot.style.format({
+                    tabla_mot[cols_mot_show].style.format({
                         "Km Perdidos": "{:,.2f} km",
                         "% del Total": "{:.2f}%",
                         "Impacto Est. ($ MXN)": "${:,.2f}"
@@ -806,7 +1054,7 @@ with tab_dash:
             st.info("No hay desglose detallado de motivos registrado para el filtro seleccionado.")
 
 # =========================================================
-# TAB 3: MATRIZ POR RUTA Y UNIDADES INACTIVAS
+# TAB 4: MATRIZ POR RUTA Y UNIDADES INACTIVAS
 # =========================================================
 with tab_rutas:
     st.subheader("Desempeño Acumulado y Financiero por Ruta")
@@ -832,11 +1080,11 @@ with tab_rutas:
         res_rutas["Semáforo"] = res_rutas["Cumplimiento %"].apply(badge_semaforo)
         res_rutas = res_rutas.sort_values("Cumplimiento %", ascending=False)
 
-        cols_mostrar = [
-            "Semáforo", "RUTA", "PATIO", "Días",
-            "Programados completos", "Realizados", "KM PERDIDOS",
-            "Km penalizado", "KM A COBRAR", "INGRESO", "INGRESO_PERDIDO"
-        ]
+        cols_mostrar = ["Semáforo", "RUTA", "PATIO", "Días"]
+        if ver_km:
+            cols_mostrar += ["Programados completos", "Realizados", "KM PERDIDOS", "Km penalizado", "KM A COBRAR"]
+        if ver_mxn:
+            cols_mostrar += ["INGRESO", "INGRESO_PERDIDO"]
 
         st.dataframe(
             res_rutas[cols_mostrar].style.format({
@@ -863,7 +1111,8 @@ with tab_rutas:
         )
         df_fr_show = df_flota_rutas[
             (df_flota_rutas["TURNO"].isin(filtro_turno_hist)) &
-            (df_flota_rutas["PATIO"].isin(patios_sel))
+            (df_flota_rutas["PATIO"].isin(patios_sel)) &
+            (df_flota_rutas["FECHA"].dt.year.isin(anios_sel))
         ].copy()
         if rutas_sel:
             df_fr_show = df_fr_show[df_fr_show["RUTA"].isin(rutas_sel)]
@@ -887,7 +1136,7 @@ with tab_rutas:
         st.info("Aún no hay registros de despacho/inactivos por ruta capturados. Regístralos en la pestaña 'Captura Diaria'.")
 
 # =========================================================
-# TAB 4: CAPTURA DIARIA EN LA APP (MATUTINO, VESPERTINO Y CIERRE KM)
+# TAB 5: CAPTURA DIARIA EN LA APP (MATUTINO, VESPERTINO Y CIERRE KM)
 # =========================================================
 with tab_captura:
     st.subheader("Captura Diaria Directa en la App")
@@ -1024,7 +1273,7 @@ with tab_captura:
 
         with open(ARCHIVO_LOCAL_DB, "wb") as f:
             f.write(guardar_consolidado_excel(
-                st.session_state["df_prod"],
+                st.session_state["df_prod"].drop(columns=["AÑO"], errors="ignore"),
                 st.session_state["df_perd"],
                 st.session_state["df_flota"],
                 st.session_state["df_flota_rutas"]
@@ -1199,7 +1448,7 @@ with tab_captura:
 
         with open(ARCHIVO_LOCAL_DB, "wb") as f:
             f.write(guardar_consolidado_excel(
-                st.session_state["df_prod"],
+                st.session_state["df_prod"].drop(columns=["AÑO"], errors="ignore"),
                 st.session_state["df_perd"],
                 st.session_state["df_flota"],
                 st.session_state["df_flota_rutas"]
