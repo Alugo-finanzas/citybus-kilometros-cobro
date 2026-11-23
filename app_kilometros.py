@@ -351,11 +351,26 @@ with st.sidebar:
         default=["EPQ", "CDM"]
     )
 
-    rutas_disponibles = sorted(df_prod["RUTA"].unique())
+    if not patios_sel:
+        st.warning("⚠️ Selecciona al menos un patio (EPQ o CDM).")
+        if st.button("🔒 Cerrar sesión", use_container_width=True):
+            st.session_state["autenticado"] = False
+            st.rerun()
+        st.stop()
+
+    # Filtrar dinámicamente solo las rutas que pertenecen al patio(s) seleccionado(s)
+    rutas_en_datos = set(df_prod[df_prod["PATIO"].isin(patios_sel)]["RUTA"].unique())
+    rutas_en_mapa = {r for r, p in MAPA_RUTA_PATIO.items() if p in patios_sel}
+    rutas_disponibles = sorted(rutas_en_datos | (rutas_en_mapa & set(df_prod["RUTA"].unique())))
+
+    # Limpiar automáticamente rutas seleccionadas si el usuario cambia a un patio donde no operan
+    rutas_previas = [r for r in st.session_state.get("filtro_rutas_widget", []) if r in rutas_disponibles]
+    st.session_state["filtro_rutas_widget"] = rutas_previas
+
     rutas_sel = st.multiselect(
-        "Rutas (vacío = todas)",
+        "Rutas del patio seleccionado (vacío = todas)",
         options=rutas_disponibles,
-        default=[]
+        key="filtro_rutas_widget"
     )
 
     st.divider()
@@ -424,159 +439,166 @@ with tab_semanal:
     if rutas_sel:
         df_sem_base = df_sem_base[df_sem_base["RUTA"].isin(rutas_sel)]
 
-    df_sem_base["SEM_INI"] = df_sem_base["FECHA"].dt.to_period("W-SUN").apply(lambda r: r.start_time)
-    df_sem_base["SEM_FIN"] = df_sem_base["FECHA"].dt.to_period("W-SUN").apply(lambda r: r.end_time)
+    if df_sem_base.empty:
+        st.info("No hay registros disponibles para el patio o ruta seleccionados.")
+    else:
+        df_sem_base["SEM_INI"] = df_sem_base["FECHA"].dt.to_period("W-SUN").apply(lambda r: r.start_time)
+        df_sem_base["SEM_FIN"] = df_sem_base["FECHA"].dt.to_period("W-SUN").apply(lambda r: r.end_time)
 
-    resumen_sem = df_sem_base.groupby(["SEM_INI", "SEM_FIN"], as_index=False).agg(
-        Días=("FECHA", "nunique"),
-        Km_Programados=("Programados completos", "sum"),
-        Km_Realizados=("Realizados", "sum"),
-        Km_Penalizados=("Km penalizado", "sum"),
-        Km_a_Cobrar=("KM A COBRAR", "sum"),
-        Monto_a_Cobrar_MXN=("INGRESO", "sum"),
-        Ingreso_Perdido_MXN=("INGRESO_PERDIDO", "sum"),
-        Tiene_Estimados=("ES_ESTIMADO", "any")
-    ).sort_values("SEM_INI", ascending=False)
-
-    resumen_sem["Semana"] = (
-        resumen_sem["SEM_INI"].dt.strftime("%d/%b") + " al " + resumen_sem["SEM_FIN"].dt.strftime("%d/%b/%Y")
-    )
-    resumen_sem["Cumplimiento %"] = (resumen_sem["Km_Realizados"] / resumen_sem["Km_Programados"] * 100).round(2)
-    resumen_sem["Estatus"] = resumen_sem.apply(
-        lambda r: ("⚠️ Parcial" if r["Días"] < 7 else "✅ Completa") + (" (c/ est.)" if r["Tiene_Estimados"] else ""),
-        axis=1
-    )
-
-    sem_actual = resumen_sem.iloc[0]
-    sem_completa_df = resumen_sem[resumen_sem["Días"] == 7]
-    ult_completa = sem_completa_df.iloc[0] if not sem_completa_df.empty else sem_actual
-
-    c_s1, c_s2, c_s3, c_s4 = st.columns(4)
-    c_s1.metric(
-        f"Semana en Curso ({sem_actual['Semana']})",
-        f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
-        delta=f"{int(sem_actual['Días'])} de 7 días capturados",
-        delta_color="off"
-    )
-    c_s2.metric(
-        f"Última Semana Completa ({ult_completa['Semana']})",
-        f"${ult_completa['Monto_a_Cobrar_MXN']:,.2f}",
-        delta=f"{ult_completa['Km_a_Cobrar']:,.1f} km a cobrar",
-        delta_color="normal"
-    )
-    c_s3.metric(
-        "Promedio Semanal (Semanas 7 días)",
-        f"${sem_completa_df['Monto_a_Cobrar_MXN'].mean():,.2f}" if not sem_completa_df.empty else f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
-        delta=f"Cumpl. prom: {sem_completa_df['Cumplimiento %'].mean():.2f}%" if not sem_completa_df.empty else "",
-        delta_color="off"
-    )
-    c_s4.metric(
-        "Dejado de Cobrar (Últ. Sem. Completa)",
-        f"${ult_completa['Ingreso_Perdido_MXN']:,.2f}",
-        delta=f"Penalizados: {ult_completa['Km_Penalizados']:,.1f} km",
-        delta_color="inverse"
-    )
-
-    st.markdown("---")
-
-    cols_sem_tabla = [
-        "Semana", "Estatus", "Días", "Cumplimiento %",
-        "Km_Programados", "Km_Realizados", "Km_Penalizados",
-        "Km_a_Cobrar", "Monto_a_Cobrar_MXN", "Ingreso_Perdido_MXN"
-    ]
-    st.dataframe(
-        resumen_sem[cols_sem_tabla].style.format({
-            "Cumplimiento %": "{:.2f}%",
-            "Km_Programados": "{:,.2f}",
-            "Km_Realizados": "{:,.2f}",
-            "Km_Penalizados": "{:,.2f}",
-            "Km_a_Cobrar": "{:,.2f}",
-            "Monto_a_Cobrar_MXN": "${:,.2f}",
-            "Ingreso_Perdido_MXN": "${:,.2f}"
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.markdown("### Desglose Detallado por Semana")
-    semana_elegida = st.selectbox(
-        "Selecciona la semana que quieres desglosar por Patio y Ruta:",
-        options=resumen_sem["Semana"].tolist(),
-        index=0
-    )
-
-    df_sem_sel = df_sem_base[
-        (df_sem_base["SEM_INI"].dt.strftime("%d/%b") + " al " + df_sem_base["SEM_FIN"].dt.strftime("%d/%b/%Y")) == semana_elegida
-    ].copy()
-
-    col_sd1, col_sd2 = st.columns([1, 1.5])
-    with col_sd1:
-        st.markdown("**Cobro por Patio en la Semana**")
-        patio_sem = df_sem_sel.groupby("PATIO", as_index=False).agg(
+        resumen_sem = df_sem_base.groupby(["SEM_INI", "SEM_FIN"], as_index=False).agg(
             Días=("FECHA", "nunique"),
+            Km_Programados=("Programados completos", "sum"),
+            Km_Realizados=("Realizados", "sum"),
+            Km_Penalizados=("Km penalizado", "sum"),
             Km_a_Cobrar=("KM A COBRAR", "sum"),
             Monto_a_Cobrar_MXN=("INGRESO", "sum"),
-            Dejado_de_Cobrar_MXN=("INGRESO_PERDIDO", "sum")
+            Ingreso_Perdido_MXN=("INGRESO_PERDIDO", "sum"),
+            Tiene_Estimados=("ES_ESTIMADO", "any")
+        ).sort_values("SEM_INI", ascending=False)
+
+        resumen_sem["Semana"] = (
+            resumen_sem["SEM_INI"].dt.strftime("%d/%b") + " al " + resumen_sem["SEM_FIN"].dt.strftime("%d/%b/%Y")
         )
+        resumen_sem["Cumplimiento %"] = (
+            (resumen_sem["Km_Realizados"] / resumen_sem["Km_Programados"] * 100)
+            .where(resumen_sem["Km_Programados"] > 0, 0.0)
+            .round(2)
+        )
+        resumen_sem["Estatus"] = resumen_sem.apply(
+            lambda r: ("⚠️ Parcial" if r["Días"] < 7 else "✅ Completa") + (" (c/ est.)" if r["Tiene_Estimados"] else ""),
+            axis=1
+        )
+
+        sem_actual = resumen_sem.iloc[0]
+        sem_completa_df = resumen_sem[resumen_sem["Días"] == 7]
+        ult_completa = sem_completa_df.iloc[0] if not sem_completa_df.empty else sem_actual
+
+        c_s1, c_s2, c_s3, c_s4 = st.columns(4)
+        c_s1.metric(
+            f"Semana en Curso ({sem_actual['Semana']})",
+            f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
+            delta=f"{int(sem_actual['Días'])} de 7 días capturados",
+            delta_color="off"
+        )
+        c_s2.metric(
+            f"Última Semana Completa ({ult_completa['Semana']})",
+            f"${ult_completa['Monto_a_Cobrar_MXN']:,.2f}",
+            delta=f"{ult_completa['Km_a_Cobrar']:,.1f} km a cobrar",
+            delta_color="normal"
+        )
+        c_s3.metric(
+            "Promedio Semanal (Semanas 7 días)",
+            f"${sem_completa_df['Monto_a_Cobrar_MXN'].mean():,.2f}" if not sem_completa_df.empty else f"${sem_actual['Monto_a_Cobrar_MXN']:,.2f}",
+            delta=f"Cumpl. prom: {sem_completa_df['Cumplimiento %'].mean():.2f}%" if not sem_completa_df.empty else "",
+            delta_color="off"
+        )
+        c_s4.metric(
+            "Dejado de Cobrar (Últ. Sem. Completa)",
+            f"${ult_completa['Ingreso_Perdido_MXN']:,.2f}",
+            delta=f"Penalizados: {ult_completa['Km_Penalizados']:,.1f} km",
+            delta_color="inverse"
+        )
+
+        st.markdown("---")
+
+        cols_sem_tabla = [
+            "Semana", "Estatus", "Días", "Cumplimiento %",
+            "Km_Programados", "Km_Realizados", "Km_Penalizados",
+            "Km_a_Cobrar", "Monto_a_Cobrar_MXN", "Ingreso_Perdido_MXN"
+        ]
         st.dataframe(
-            patio_sem.style.format({
+            resumen_sem[cols_sem_tabla].style.format({
+                "Cumplimiento %": "{:.2f}%",
+                "Km_Programados": "{:,.2f}",
+                "Km_Realizados": "{:,.2f}",
+                "Km_Penalizados": "{:,.2f}",
                 "Km_a_Cobrar": "{:,.2f}",
                 "Monto_a_Cobrar_MXN": "${:,.2f}",
-                "Dejado_de_Cobrar_MXN": "${:,.2f}"
+                "Ingreso_Perdido_MXN": "${:,.2f}"
             }),
             use_container_width=True,
             hide_index=True
         )
 
-        dia_sem = df_sem_sel.groupby("FECHA", as_index=False).agg(
-            Km_a_Cobrar=("KM A COBRAR", "sum"),
-            Monto_MXN=("INGRESO", "sum")
-        ).sort_values("FECHA")
-        dia_sem["Día"] = dia_sem["FECHA"].dt.strftime("%a %d/%b")
-        fig_dia_sem = px.bar(
-            dia_sem, x="Día", y="Monto_MXN", text_auto="$,.0f",
-            title="Cobro Diario dentro de la Semana",
-            color_discrete_sequence=["#16a34a"]
-        )
-        fig_dia_sem.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="MXN ($)")
-        st.plotly_chart(fig_dia_sem, use_container_width=True)
-
-    with col_sd2:
-        st.markdown("**Desglose por Ruta para Facturación Semanal**")
-        ruta_sem = df_sem_sel.groupby(["RUTA", "PATIO"], as_index=False).agg(
-            Días=("FECHA", "nunique"),
-            Programados=("Programados completos", "sum"),
-            Realizados=("Realizados", "sum"),
-            Penalizados=("Km penalizado", "sum"),
-            Km_a_Cobrar=("KM A COBRAR", "sum"),
-            Monto_a_Cobrar_MXN=("INGRESO", "sum")
-        ).sort_values("Monto_a_Cobrar_MXN", ascending=False)
-
-        st.dataframe(
-            ruta_sem.style.format({
-                "Programados": "{:,.2f}",
-                "Realizados": "{:,.2f}",
-                "Penalizados": "{:,.2f}",
-                "Km_a_Cobrar": "{:,.2f}",
-                "Monto_a_Cobrar_MXN": "${:,.2f}"
-            }),
-            use_container_width=True,
-            hide_index=True,
-            height=410
+        st.markdown("### Desglose Detallado por Semana")
+        semana_elegida = st.selectbox(
+            "Selecciona la semana que quieres desglosar por Patio y Ruta:",
+            options=resumen_sem["Semana"].tolist(),
+            index=0
         )
 
-        out_sem = io.BytesIO()
-        with pd.ExcelWriter(out_sem, engine="openpyxl") as writer:
-            resumen_sem[cols_sem_tabla].to_excel(writer, sheet_name="Resumen Todas las Semanas", index=False)
-            patio_sem.to_excel(writer, sheet_name="Cobro por Patio", index=False)
-            ruta_sem.to_excel(writer, sheet_name="Cobro por Ruta", index=False)
-        st.download_button(
-            label=f"Descargar Excel de Cobro ({semana_elegida})",
-            data=out_sem.getvalue(),
-            file_name=f"Cobro_Semanal_Citybus_{semana_elegida.replace('/', '-').replace(' ', '_')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+        df_sem_sel = df_sem_base[
+            (df_sem_base["SEM_INI"].dt.strftime("%d/%b") + " al " + df_sem_base["SEM_FIN"].dt.strftime("%d/%b/%Y")) == semana_elegida
+        ].copy()
+
+        col_sd1, col_sd2 = st.columns([1, 1.5])
+        with col_sd1:
+            st.markdown("**Cobro por Patio en la Semana**")
+            patio_sem = df_sem_sel.groupby("PATIO", as_index=False).agg(
+                Días=("FECHA", "nunique"),
+                Km_a_Cobrar=("KM A COBRAR", "sum"),
+                Monto_a_Cobrar_MXN=("INGRESO", "sum"),
+                Dejado_de_Cobrar_MXN=("INGRESO_PERDIDO", "sum")
+            )
+            st.dataframe(
+                patio_sem.style.format({
+                    "Km_a_Cobrar": "{:,.2f}",
+                    "Monto_a_Cobrar_MXN": "${:,.2f}",
+                    "Dejado_de_Cobrar_MXN": "${:,.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            dia_sem = df_sem_sel.groupby("FECHA", as_index=False).agg(
+                Km_a_Cobrar=("KM A COBRAR", "sum"),
+                Monto_MXN=("INGRESO", "sum")
+            ).sort_values("FECHA")
+            dia_sem["Día"] = dia_sem["FECHA"].dt.strftime("%a %d/%b")
+            fig_dia_sem = px.bar(
+                dia_sem, x="Día", y="Monto_MXN", text_auto="$,.0f",
+                title="Cobro Diario dentro de la Semana",
+                color_discrete_sequence=["#16a34a"]
+            )
+            fig_dia_sem.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="MXN ($)")
+            st.plotly_chart(fig_dia_sem, use_container_width=True)
+
+        with col_sd2:
+            st.markdown("**Desglose por Ruta para Facturación Semanal**")
+            ruta_sem = df_sem_sel.groupby(["RUTA", "PATIO"], as_index=False).agg(
+                Días=("FECHA", "nunique"),
+                Programados=("Programados completos", "sum"),
+                Realizados=("Realizados", "sum"),
+                Penalizados=("Km penalizado", "sum"),
+                Km_a_Cobrar=("KM A COBRAR", "sum"),
+                Monto_a_Cobrar_MXN=("INGRESO", "sum")
+            ).sort_values("Monto_a_Cobrar_MXN", ascending=False)
+
+            st.dataframe(
+                ruta_sem.style.format({
+                    "Programados": "{:,.2f}",
+                    "Realizados": "{:,.2f}",
+                    "Penalizados": "{:,.2f}",
+                    "Km_a_Cobrar": "{:,.2f}",
+                    "Monto_a_Cobrar_MXN": "${:,.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True,
+                height=410
+            )
+
+            out_sem = io.BytesIO()
+            with pd.ExcelWriter(out_sem, engine="openpyxl") as writer:
+                resumen_sem[cols_sem_tabla].to_excel(writer, sheet_name="Resumen Todas las Semanas", index=False)
+                patio_sem.to_excel(writer, sheet_name="Cobro por Patio", index=False)
+                ruta_sem.to_excel(writer, sheet_name="Cobro por Ruta", index=False)
+            st.download_button(
+                label=f"Descargar Excel de Cobro ({semana_elegida})",
+                data=out_sem.getvalue(),
+                file_name=f"Cobro_Semanal_Citybus_{semana_elegida.replace('/', '-').replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
 # =========================================================
 # TAB 2: DASHBOARD EJECUTIVO & FLOTA
@@ -631,6 +653,8 @@ with tab_dash:
                 (df_flota_rutas["PATIO"].isin(patios_sel)) &
                 (df_flota_rutas["TURNO"] == turno_ver)
             ] if not df_flota_rutas.empty else pd.DataFrame()
+            if not fl_r_hoy.empty and rutas_sel:
+                fl_r_hoy = fl_r_hoy[fl_r_hoy["RUTA"].isin(rutas_sel)]
 
             f1, f2, f3, f4, f5 = st.columns(5)
             desp_tot = int(fl_hoy["Buses_despacho"].sum()) if not fl_hoy.empty else 0
@@ -689,7 +713,11 @@ with tab_dash:
             "INGRESO": "sum",
             "INGRESO_PERDIDO": "sum"
         }).sort_values("FECHA")
-        diario["Cumplimiento %"] = (diario["Realizados"] / diario["Programados completos"] * 100).round(2)
+        diario["Cumplimiento %"] = (
+            (diario["Realizados"] / diario["Programados completos"] * 100)
+            .where(diario["Programados completos"] > 0, 0.0)
+            .round(2)
+        )
         diario["Promedio Móvil 7D"] = diario["Cumplimiento %"].rolling(7, min_periods=1).mean().round(2)
 
         col_g1, col_g2 = st.columns([1.6, 1])
@@ -718,7 +746,11 @@ with tab_dash:
                 "INGRESO": "sum",
                 "INGRESO_PERDIDO": "sum"
             })
-            patio_df["Cumplimiento %"] = (patio_df["Realizados"] / patio_df["Programados completos"] * 100).round(2)
+            patio_df["Cumplimiento %"] = (
+                (patio_df["Realizados"] / patio_df["Programados completos"] * 100)
+                .where(patio_df["Programados completos"] > 0, 0.0)
+                .round(2)
+            )
 
             if unidad_vista == "Solo Financiero ($ MXN)":
                 fig_patio = px.bar(
@@ -778,41 +810,48 @@ with tab_dash:
 # =========================================================
 with tab_rutas:
     st.subheader("Desempeño Acumulado y Financiero por Ruta")
-    res_rutas = df_f.groupby(["RUTA", "PATIO"], as_index=False).agg({
-        "FECHA": "nunique",
-        "Programados completos": "sum",
-        "Realizados": "sum",
-        "Km penalizado": "sum",
-        "KM A COBRAR": "sum",
-        "KM PERDIDOS": "sum",
-        "INGRESO": "sum",
-        "INGRESO_PERDIDO": "sum"
-    }).rename(columns={"FECHA": "Días"})
+    if df_f.empty:
+        st.info("No hay registros disponibles para el patio o ruta seleccionados.")
+    else:
+        res_rutas = df_f.groupby(["RUTA", "PATIO"], as_index=False).agg({
+            "FECHA": "nunique",
+            "Programados completos": "sum",
+            "Realizados": "sum",
+            "Km penalizado": "sum",
+            "KM A COBRAR": "sum",
+            "KM PERDIDOS": "sum",
+            "INGRESO": "sum",
+            "INGRESO_PERDIDO": "sum"
+        }).rename(columns={"FECHA": "Días"})
 
-    res_rutas["Cumplimiento %"] = (res_rutas["Realizados"] / res_rutas["Programados completos"] * 100).round(2)
-    res_rutas["Semáforo"] = res_rutas["Cumplimiento %"].apply(badge_semaforo)
-    res_rutas = res_rutas.sort_values("Cumplimiento %", ascending=False)
+        res_rutas["Cumplimiento %"] = (
+            (res_rutas["Realizados"] / res_rutas["Programados completos"] * 100)
+            .where(res_rutas["Programados completos"] > 0, 0.0)
+            .round(2)
+        )
+        res_rutas["Semáforo"] = res_rutas["Cumplimiento %"].apply(badge_semaforo)
+        res_rutas = res_rutas.sort_values("Cumplimiento %", ascending=False)
 
-    cols_mostrar = [
-        "Semáforo", "RUTA", "PATIO", "Días",
-        "Programados completos", "Realizados", "KM PERDIDOS",
-        "Km penalizado", "KM A COBRAR", "INGRESO", "INGRESO_PERDIDO"
-    ]
+        cols_mostrar = [
+            "Semáforo", "RUTA", "PATIO", "Días",
+            "Programados completos", "Realizados", "KM PERDIDOS",
+            "Km penalizado", "KM A COBRAR", "INGRESO", "INGRESO_PERDIDO"
+        ]
 
-    st.dataframe(
-        res_rutas[cols_mostrar].style.format({
-            "Programados completos": "{:,.2f}",
-            "Realizados": "{:,.2f}",
-            "KM PERDIDOS": "{:,.2f}",
-            "Km penalizado": "{:,.2f}",
-            "KM A COBRAR": "{:,.2f}",
-            "INGRESO": "${:,.2f}",
-            "INGRESO_PERDIDO": "${:,.2f}"
-        }),
-        use_container_width=True,
-        hide_index=True,
-        height=540
-    )
+        st.dataframe(
+            res_rutas[cols_mostrar].style.format({
+                "Programados completos": "{:,.2f}",
+                "Realizados": "{:,.2f}",
+                "KM PERDIDOS": "{:,.2f}",
+                "Km penalizado": "{:,.2f}",
+                "KM A COBRAR": "{:,.2f}",
+                "INGRESO": "${:,.2f}",
+                "INGRESO_PERDIDO": "${:,.2f}"
+            }),
+            use_container_width=True,
+            hide_index=True,
+            height=540
+        )
 
     st.markdown("---")
     st.subheader("Histórico de Despacho y Unidades Inactivas por Ruta")
@@ -822,7 +861,14 @@ with tab_rutas:
             options=TURNOS_FLOTA,
             default=TURNOS_FLOTA
         )
-        df_fr_show = df_flota_rutas[df_flota_rutas["TURNO"].isin(filtro_turno_hist)].sort_values(
+        df_fr_show = df_flota_rutas[
+            (df_flota_rutas["TURNO"].isin(filtro_turno_hist)) &
+            (df_flota_rutas["PATIO"].isin(patios_sel))
+        ].copy()
+        if rutas_sel:
+            df_fr_show = df_fr_show[df_fr_show["RUTA"].isin(rutas_sel)]
+
+        df_fr_show = df_fr_show.sort_values(
             ["FECHA", "TURNO", "RUTA"], ascending=[False, True, True]
         )
         st.dataframe(
